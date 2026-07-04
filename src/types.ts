@@ -50,7 +50,9 @@ export interface ActualApiServiceI {
     categoryId: string,
   ): Promise<void>
 
-  runBankSync(): Promise<void>
+  runBankSync(accountId?: string): Promise<void>
+
+  releaseLock(): void
 
   createCategory(name: string, groupId: string): Promise<string>
 
