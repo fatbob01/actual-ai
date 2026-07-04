@@ -66,7 +66,7 @@ services:
     restart: unless-stopped
 
   actual-ai:
-    image: docker.io/sakowicz/actual-ai:latest
+    image: docker.io/fatbob01/actual-ai:latest
     restart: unless-stopped
     depends_on:
       actual_server:

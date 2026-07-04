@@ -59,11 +59,22 @@ class ActualApiService implements ActualApiServiceI {
     this.lockPath = path.join(this.dataDir, '.actual-ai.lock');
   }
 
-  private static isConcurrentRunError(error: unknown): boolean {
-    return error instanceof Error
-      && error.message.startsWith('Another actual-ai run appears active');
+  // A signal-0 probe throws ESRCH if the pid doesn't exist, EPERM if it exists but is
+  // owned by another user, or nothing if it exists and we're allowed to signal it — the
+  // latter two both mean "alive" here. Anything other than ESRCH is treated as "alive"
+  // too: wrongly reclaiming a lock that's genuinely still in use (silent dataDir
+  // corruption) is worse than wrongly refusing to reclaim a dead one (a clear error).
+  private static isPidAlive(pid: number): boolean {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (error: unknown) {
+      return !(isErrnoException(error) && error.code === 'ESRCH');
+    }
   }
 
+  // Throws if the existing lock is still legitimately held. This is a real concurrency
+  // signal and must never be treated as "can't write the lock file" by the caller.
   private reclaimStaleLockIfAny(): void {
     const raw = this.fs.readFileSync(this.lockPath, 'utf8');
     let parsed: { pid?: number; startedAt?: string } | undefined;
@@ -80,40 +91,51 @@ class ActualApiService implements ActualApiServiceI {
       return;
     }
 
+    if (!ActualApiService.isPidAlive(pid)) {
+      // Stale lock from a crashed process; remove it.
+      this.fs.unlinkSync(this.lockPath);
+      return;
+    }
+
     const startedAtMs = parsed?.startedAt ? Date.parse(parsed.startedAt) : NaN;
     const isTooOld = Number.isFinite(startedAtMs)
       && Date.now() - startedAtMs > ActualApiService.MAX_LOCK_AGE_MS;
 
-    try {
-      process.kill(pid, 0);
-
-      if (isTooOld) {
-        // The pid looks "alive", but container restarts reset pid counters, so an
-        // unrelated process may have been assigned the same pid. A lock this old is
-        // never legitimate, so reclaim it rather than blocking forever.
-        console.warn(
-          `dataDir lock at ${this.lockPath} is held by pid=${pid} but is older than `
-          + `${ActualApiService.MAX_LOCK_AGE_MS / 3_600_000}h. Assuming it is stale `
-          + '(likely leftover from a container restart that reused this pid) and reclaiming it.',
-        );
-        this.fs.unlinkSync(this.lockPath);
-        return;
-      }
-
-      throw new Error(
-        `Another actual-ai run appears active (pid=${pid}). `
-        + `Refusing to use shared dataDir: ${this.dataDir}`,
+    if (isTooOld) {
+      // The pid looks "alive", but container restarts reset pid counters, so an
+      // unrelated process may have been assigned the same pid. A lock this old is
+      // never legitimate, so reclaim it rather than blocking forever.
+      console.warn(
+        `dataDir lock at ${this.lockPath} is held by pid=${pid} but is older than `
+        + `${ActualApiService.MAX_LOCK_AGE_MS / 3_600_000}h. Assuming it is stale `
+        + '(likely leftover from a container restart that reused this pid) and reclaiming it.',
       );
-    } catch (error: unknown) {
-      if (isErrnoException(error) && error.code === 'ESRCH') {
-        // Stale lock from a crashed process; remove it.
-        this.fs.unlinkSync(this.lockPath);
-      } else if (error instanceof Error) {
-        // Either process.kill threw something other than ESRCH, or this is the
-        // "still active" error thrown above; either way, propagate it.
-        throw error;
-      }
+      this.fs.unlinkSync(this.lockPath);
+      return;
     }
+
+    throw new Error(
+      `Another actual-ai run appears active (pid=${pid}). `
+      + `Refusing to use shared dataDir: ${this.dataDir}`,
+    );
+  }
+
+  private failOpenOnPermissionError(error: unknown): boolean {
+    if (!isErrnoException(error) || (error.code !== 'EACCES' && error.code !== 'EPERM')) {
+      return false;
+    }
+
+    // Not a concurrency signal — the environment (e.g. a misconfigured tmpfs mount)
+    // won't let us write the lock at all. Don't block classification over it; just
+    // lose the concurrent-run protection and say why.
+    console.warn(
+      `Could not acquire dataDir lock at ${this.lockPath} (${error.code}: permission denied). `
+      + 'Continuing without the lock, so concurrent runs sharing this dataDir will not be '
+      + `detected. Check that the container user can write to ${this.dataDir} `
+      + '(e.g. drop any custom tmpfs mount on that path, or grant it write access).',
+    );
+    this.lockFd = null;
+    return true;
   }
 
   private acquireDataDirLock() {
@@ -123,11 +145,19 @@ class ActualApiService implements ActualApiServiceI {
       if (!this.fs.existsSync(this.dataDir)) {
         this.fs.mkdirSync(this.dataDir, { recursive: true });
       }
+    } catch (error) {
+      if (this.failOpenOnPermissionError(error)) return;
+      throw error instanceof Error ? error : new Error('Failed to create dataDir');
+    }
 
-      if (this.fs.existsSync(this.lockPath)) {
-        this.reclaimStaleLockIfAny();
-      }
+    if (this.fs.existsSync(this.lockPath)) {
+      // Deliberately outside the try/catch below: an error here (including the
+      // "still active" throw, or a probe failure) is a real concurrency signal, not
+      // an "environment can't write the lock file" situation, and must propagate.
+      this.reclaimStaleLockIfAny();
+    }
 
+    try {
       // 'wx' creates exclusively; throws if exists.
       this.lockFd = this.fs.openSync(this.lockPath, 'wx');
       this.fs.writeFileSync(
@@ -135,35 +165,25 @@ class ActualApiService implements ActualApiServiceI {
         JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }),
       );
     } catch (error) {
-      if (ActualApiService.isConcurrentRunError(error)) {
-        throw error;
-      }
-
-      if (isErrnoException(error) && (error.code === 'EACCES' || error.code === 'EPERM')) {
-        // Not a concurrency signal — the environment (e.g. a misconfigured tmpfs mount)
-        // won't let us write the lock at all. Don't block classification over it; just
-        // lose the concurrent-run protection and say why.
-        console.warn(
-          `Could not acquire dataDir lock at ${this.lockPath} (${error.code}: permission denied). `
-          + 'Continuing without the lock, so concurrent runs sharing this dataDir will not be '
-          + `detected. Check that the container user can write to ${this.dataDir} `
-          + '(e.g. drop any custom tmpfs mount on that path, or grant it write access).',
-        );
-        this.lockFd = null;
-        return;
-      }
-
+      if (this.failOpenOnPermissionError(error)) return;
       throw error instanceof Error ? error : new Error('Failed to acquire dataDir lock');
     }
   }
 
   private releaseDataDirLock() {
+    // Only ever unlink a lock this instance actually opened. Without this check, a
+    // process that never held the lock (e.g. one that lost dataDir contention to
+    // another process legitimately sharing the same volume) could delete that other
+    // process's still-valid lock — most easily reached via releaseLock() below, which
+    // a signal handler can call at any time regardless of whether this instance is
+    // mid-run or ever acquired the lock in the first place.
+    const heldLock = this.lockFd !== null;
     try {
       if (this.lockFd !== null) {
         this.fs.closeSync(this.lockFd);
         this.lockFd = null;
       }
-      if (this.fs.existsSync(this.lockPath)) {
+      if (heldLock && this.fs.existsSync(this.lockPath)) {
         this.fs.unlinkSync(this.lockPath);
       }
     } catch {
