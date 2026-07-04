@@ -90,7 +90,7 @@ const llmModelFactory = new LlmModelFactory(
   groqBaseURL,
 );
 
-const actualApiService = new ActualApiService(
+export const actualApiService = new ActualApiService(
   actualApiClient,
   fs,
   dataDir,

@@ -442,6 +442,29 @@ describe('ActualAiService', () => {
     expect(inMemoryApiService.getWasBankSyncRan()).toBe(true);
   });
 
+  it('It should sync remaining accounts when one account fails to sync', async () => {
+    // Arrange
+    mockIsFeatureEnabled.mockImplementation((feature: string) => {
+      if (feature === 'syncAccountsBeforeClassify') return true;
+      if (feature === 'rerunMissedTransactions') return false;
+      return originalIsFeatureEnabled(feature);
+    });
+    inMemoryApiService.setAccountIdsThatFailToSync([GivenActualData.ACCOUNT_MAIN]);
+
+    // Act
+    sut = new ActualAiService(
+      transactionService,
+      inMemoryApiService,
+      notesMigrator,
+    );
+    await sut.classify();
+
+    // Assert: both accounts were attempted individually, despite one failing
+    expect(inMemoryApiService.getBankSyncAccountIds()).toEqual(
+      expect.arrayContaining([GivenActualData.ACCOUNT_MAIN, GivenActualData.ACCOUNT_OFF_BUDGET]),
+    );
+  });
+
   // Add a new test for when rerunMissedTransactions is true
   it('It should process transaction with missed tag when rerunMissedTransactions is true', async () => {
     // Arrange

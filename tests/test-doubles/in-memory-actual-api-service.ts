@@ -20,6 +20,10 @@ export default class InMemoryActualApiService implements ActualApiServiceI {
 
   private wasBankSyncRan = false;
 
+  private bankSyncAccountIds: (string | undefined)[] = [];
+
+  private accountIdsThatFailToSync = new Set<string>();
+
   private rules: RuleEntity[] = [];
 
   private readonly isDryRun: boolean;
@@ -110,13 +114,29 @@ export default class InMemoryActualApiService implements ActualApiServiceI {
     });
   }
 
-  async runBankSync(): Promise<void> {
+  async runBankSync(accountId?: string): Promise<void> {
     this.wasBankSyncRan = true;
+    this.bankSyncAccountIds.push(accountId);
+    if (accountId && this.accountIdsThatFailToSync.has(accountId)) {
+      throw new Error(`Simulated sync failure for account ${accountId}`);
+    }
     return Promise.resolve();
   }
 
   public getWasBankSyncRan(): boolean {
     return this.wasBankSyncRan;
+  }
+
+  public getBankSyncAccountIds(): (string | undefined)[] {
+    return this.bankSyncAccountIds;
+  }
+
+  public setAccountIdsThatFailToSync(accountIds: string[]): void {
+    this.accountIdsThatFailToSync = new Set(accountIds);
+  }
+
+  public releaseLock(): void {
+    // No-op for the in-memory test double.
   }
 
   async createCategory(name: string, groupId: string): Promise<string> {

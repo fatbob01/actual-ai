@@ -75,15 +75,33 @@ class ActualAiService implements ActualAiServiceI {
 
   async syncAccounts(): Promise<void> {
     console.log('Syncing bank accounts');
-    try {
-      await suppressConsoleLogsAsync(async () => this.actualApiService.runBankSync());
-      console.log('Bank accounts synced');
-    } catch (error) {
-      console.error(
-        'Error syncing bank accounts:',
-        formatError(error),
-      );
+    const accounts = await this.actualApiService.getAccounts();
+    const syncableAccounts = accounts.filter((account) => !account.closed);
+
+    let succeeded = 0;
+    let failed = 0;
+    // Sync each account independently so that one account needing attention
+    // (e.g. a stale SimpleFin connection) doesn't prevent the others from syncing.
+    // eslint-disable-next-line no-restricted-syntax
+    for (const account of syncableAccounts) {
+      try {
+        // eslint-disable-next-line no-await-in-loop
+        await suppressConsoleLogsAsync(
+          async () => this.actualApiService.runBankSync(account.id),
+        );
+        succeeded += 1;
+      } catch (error) {
+        failed += 1;
+        console.error(
+          `Error syncing bank account "${account.name}":`,
+          formatError(error),
+        );
+      }
     }
+    console.log(
+      `Bank accounts synced: ${succeeded} succeeded, ${failed} failed `
+      + `(${syncableAccounts.length} total)`,
+    );
   }
 
   private isRateLimitError(error: unknown): boolean {

@@ -33,6 +33,11 @@ class ActualApiService implements ActualApiServiceI {
 
   private readonly lockPath: string;
 
+  // A real classify() run should never legitimately take this long. Used as a fallback
+  // for reclaiming a lock whose owning pid appears "alive" only because container
+  // restarts reset the pid counter and something else now holds that same pid.
+  private static readonly MAX_LOCK_AGE_MS = 6 * 60 * 60 * 1000;
+
   constructor(
     actualApiClient: typeof import('@actual-app/api'),
     fs: typeof import('fs'),
@@ -54,50 +59,102 @@ class ActualApiService implements ActualApiServiceI {
     this.lockPath = path.join(this.dataDir, '.actual-ai.lock');
   }
 
+  private static isConcurrentRunError(error: unknown): boolean {
+    return error instanceof Error
+      && error.message.startsWith('Another actual-ai run appears active');
+  }
+
+  private reclaimStaleLockIfAny(): void {
+    const raw = this.fs.readFileSync(this.lockPath, 'utf8');
+    let parsed: { pid?: number; startedAt?: string } | undefined;
+    try {
+      parsed = JSON.parse(raw) as { pid?: number; startedAt?: string };
+    } catch {
+      parsed = undefined;
+    }
+
+    const pid = parsed?.pid;
+    if (typeof pid !== 'number') {
+      // Unparseable/stale lock; remove it.
+      this.fs.unlinkSync(this.lockPath);
+      return;
+    }
+
+    const startedAtMs = parsed?.startedAt ? Date.parse(parsed.startedAt) : NaN;
+    const isTooOld = Number.isFinite(startedAtMs)
+      && Date.now() - startedAtMs > ActualApiService.MAX_LOCK_AGE_MS;
+
+    try {
+      process.kill(pid, 0);
+
+      if (isTooOld) {
+        // The pid looks "alive", but container restarts reset pid counters, so an
+        // unrelated process may have been assigned the same pid. A lock this old is
+        // never legitimate, so reclaim it rather than blocking forever.
+        console.warn(
+          `dataDir lock at ${this.lockPath} is held by pid=${pid} but is older than `
+          + `${ActualApiService.MAX_LOCK_AGE_MS / 3_600_000}h. Assuming it is stale `
+          + '(likely leftover from a container restart that reused this pid) and reclaiming it.',
+        );
+        this.fs.unlinkSync(this.lockPath);
+        return;
+      }
+
+      throw new Error(
+        `Another actual-ai run appears active (pid=${pid}). `
+        + `Refusing to use shared dataDir: ${this.dataDir}`,
+      );
+    } catch (error: unknown) {
+      if (isErrnoException(error) && error.code === 'ESRCH') {
+        // Stale lock from a crashed process; remove it.
+        this.fs.unlinkSync(this.lockPath);
+      } else if (error instanceof Error) {
+        // Either process.kill threw something other than ESRCH, or this is the
+        // "still active" error thrown above; either way, propagate it.
+        throw error;
+      }
+    }
+  }
+
   private acquireDataDirLock() {
     // Prevent multiple concurrent runs from sharing the same dataDir. The underlying
     // Actual sqlite DB is not safe for concurrent writers and can end up "out-of-sync".
-    if (!this.fs.existsSync(this.dataDir)) {
-      this.fs.mkdirSync(this.dataDir, { recursive: true });
-    }
-
-    if (this.fs.existsSync(this.lockPath)) {
-      try {
-        const raw = this.fs.readFileSync(this.lockPath, 'utf8');
-        const parsed = JSON.parse(raw) as { pid?: number; startedAt?: string };
-        const pid = parsed?.pid;
-        if (typeof pid === 'number') {
-          try {
-            process.kill(pid, 0);
-            throw new Error(
-              `Another actual-ai run appears active (pid=${pid}). `
-              + `Refusing to use shared dataDir: ${this.dataDir}`,
-            );
-          } catch (error: unknown) {
-            if (isErrnoException(error) && error.code === 'ESRCH') {
-              // Stale lock from a crashed process; remove it.
-              this.fs.unlinkSync(this.lockPath);
-            } else if (error instanceof Error) {
-              // process.kill threw, but it's not ESRCH; rethrow.
-              throw error;
-            }
-          }
-        } else {
-          // Unparseable/stale lock; remove it.
-          this.fs.unlinkSync(this.lockPath);
-        }
-      } catch (e) {
-        // If anything goes wrong reading the lock, fail safe.
-        throw e instanceof Error ? e : new Error('Failed to read dataDir lock');
+    try {
+      if (!this.fs.existsSync(this.dataDir)) {
+        this.fs.mkdirSync(this.dataDir, { recursive: true });
       }
-    }
 
-    // 'wx' creates exclusively; throws if exists.
-    this.lockFd = this.fs.openSync(this.lockPath, 'wx');
-    this.fs.writeFileSync(
-      this.lockFd,
-      JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }),
-    );
+      if (this.fs.existsSync(this.lockPath)) {
+        this.reclaimStaleLockIfAny();
+      }
+
+      // 'wx' creates exclusively; throws if exists.
+      this.lockFd = this.fs.openSync(this.lockPath, 'wx');
+      this.fs.writeFileSync(
+        this.lockFd,
+        JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }),
+      );
+    } catch (error) {
+      if (ActualApiService.isConcurrentRunError(error)) {
+        throw error;
+      }
+
+      if (isErrnoException(error) && (error.code === 'EACCES' || error.code === 'EPERM')) {
+        // Not a concurrency signal — the environment (e.g. a misconfigured tmpfs mount)
+        // won't let us write the lock at all. Don't block classification over it; just
+        // lose the concurrent-run protection and say why.
+        console.warn(
+          `Could not acquire dataDir lock at ${this.lockPath} (${error.code}: permission denied). `
+          + 'Continuing without the lock, so concurrent runs sharing this dataDir will not be '
+          + `detected. Check that the container user can write to ${this.dataDir} `
+          + '(e.g. drop any custom tmpfs mount on that path, or grant it write access).',
+        );
+        this.lockFd = null;
+        return;
+      }
+
+      throw error instanceof Error ? error : new Error('Failed to acquire dataDir lock');
+    }
   }
 
   private releaseDataDirLock() {
@@ -112,6 +169,13 @@ class ActualApiService implements ActualApiServiceI {
     } catch {
       // Best-effort cleanup.
     }
+  }
+
+  // Public, synchronous, best-effort. Intended for use from process signal handlers
+  // (e.g. SIGTERM on `docker restart`) where we can't rely on in-flight async work
+  // running its normal finally/shutdown path before the process exits.
+  public releaseLock(): void {
+    this.releaseDataDirLock();
   }
 
   public async initializeApi() {
@@ -222,12 +286,12 @@ class ActualApiService implements ActualApiServiceI {
     await this.actualApiClient.updateTransaction(id, { notes, category: categoryId });
   }
 
-  public async runBankSync(): Promise<void> {
+  public async runBankSync(accountId?: string): Promise<void> {
     if (this.isDryRun) {
-      console.log('DRY RUN: Would run bank sync');
+      console.log(`DRY RUN: Would run bank sync${accountId ? ` for account ${accountId}` : ''}`);
       return;
     }
-    await this.actualApiClient.runBankSync();
+    await this.actualApiClient.runBankSync(accountId ? { accountId } : undefined);
   }
 
   public async createCategory(name: string, groupId: string): Promise<string> {
