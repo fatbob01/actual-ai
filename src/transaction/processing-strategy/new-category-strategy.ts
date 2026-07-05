@@ -2,10 +2,21 @@ import { CategoryEntity, TransactionEntity } from '@actual-app/core/src/types/mo
 import type {
   ProcessingStrategyI, UnifiedResponse,
 } from '../../types';
+import { isFeatureEnabled } from '../../config';
 
 class NewCategoryStrategy implements ProcessingStrategyI {
   public isSatisfiedBy(response: UnifiedResponse): boolean {
     if (response.newCategory === undefined) {
+      return false;
+    }
+    if (!isFeatureEnabled('suggestNewCategories')) {
+      // The prompt is only supposed to offer "new" when this feature is on, but LLMs
+      // don't always follow instructions. Claiming this response here when the feature
+      // is off would silently drop it: CategorySuggester.suggest() (which actually
+      // creates the category and updates the transaction) is gated on the same flag in
+      // TransactionService, so nothing would ever act on it. Reject it instead so the
+      // transaction falls through to the "unexpected response" handling and gets
+      // tagged not-guessed rather than silently retried forever.
       return false;
     }
     return response.type === 'new';
