@@ -64,4 +64,16 @@ describe('parseLlmResponse', () => {
     expect(() => parseLlmResponse('I cannot categorize this [enricher] transaction.'))
       .toThrow('Invalid response format from LLM');
   });
+
+  // Regression: the prose-recovery scan started from the last "{" in the text and
+  // returned as soon as any candidate parsed. For a "new" response, that's the
+  // nested newCategory object, not the full response — it parsed fine on its own,
+  // so the outer response (the one with "type") was never recovered.
+  it('recovers the full response, not a nested object, from a prose "new"-category response', () => {
+    const prose = 'The `[enricher]` note suggests this is a pet store purchase.\n\n'
+      + '{"type": "new", "newCategory": {"name": "Pets", "groupName": "Home", "groupIsNew": true}}';
+    const result = parseLlmResponse(prose);
+    expect(result.type).toBe('new');
+    expect(result.newCategory).toEqual({ name: 'Pets', groupName: 'Home', groupIsNew: true });
+  });
 });

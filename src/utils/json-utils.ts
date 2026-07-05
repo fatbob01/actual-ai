@@ -26,10 +26,15 @@ function cleanJsonResponse(text: string): string {
 // Models sometimes prepend prose reasoning to the JSON object — and when the
 // prompt contains bracketed note tags like "[enricher]", the prose echoes them,
 // so cleanJsonResponse's "first structure character" cut lands inside the prose
-// instead of the JSON. Recover by scanning for the last balanced {...} block
-// that parses. Braces inside JSON strings can break the depth count; then the
-// parse fails and the scan moves on to an earlier candidate.
+// instead of the JSON. Recover by scanning for a balanced {...} block that
+// parses. Braces inside JSON strings can break the depth count for a given
+// start, so keep trying earlier starts even after finding one that parses:
+// a response with a nested object (e.g. "new" with a "newCategory" object)
+// has more than one balanced, independently-parseable candidate, and we want
+// the outermost one — found by preferring the earliest start whose candidate
+// still parses, rather than stopping at the first (innermost) success.
 function extractLastJsonObject(text: string): Partial<UnifiedResponse> | null {
+  let best: Partial<UnifiedResponse> | null = null;
   for (let start = text.lastIndexOf('{'); start !== -1; start = text.lastIndexOf('{', start - 1)) {
     let depth = 0;
     for (let i = start; i < text.length; i += 1) {
@@ -38,15 +43,17 @@ function extractLastJsonObject(text: string): Partial<UnifiedResponse> | null {
         depth -= 1;
         if (depth === 0) {
           try {
-            return JSON.parse(text.slice(start, i + 1)) as Partial<UnifiedResponse>;
+            best = JSON.parse(text.slice(start, i + 1)) as Partial<UnifiedResponse>;
           } catch {
-            break;
+            // This start's candidate didn't parse; keep whatever we already
+            // found (from a later, more-nested start) and try an earlier one.
           }
+          break;
         }
       }
     }
   }
-  return null;
+  return best;
 }
 
 function parseLlmResponse(text: string): UnifiedResponse {
