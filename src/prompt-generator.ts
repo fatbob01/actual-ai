@@ -5,7 +5,7 @@ import {
   PromptGeneratorI,
 } from './types';
 import PromptTemplateException from './exceptions/prompt-template-exception';
-import { isToolEnabled } from './config';
+import { isFeatureEnabled, isToolEnabled } from './config';
 import { transformRulesToDescriptions } from './utils/rule-utils';
 
 class PromptGenerator implements PromptGeneratorI {
@@ -60,6 +60,7 @@ class PromptGenerator implements PromptGeneratorI {
         cleared: transaction.cleared,
         reconciled: transaction.reconciled,
         hasWebSearchTool: webSearchEnabled,
+        allowNewCategories: isFeatureEnabled('suggestNewCategories'),
       });
     } catch {
       console.error('Error generating prompt. Check syntax of your template.');

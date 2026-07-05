@@ -80,6 +80,7 @@ describe('PromptGenerator', () => {
       cleared: transaction.cleared ?? false,
       reconciled: transaction.reconciled ?? false,
       hasWebSearchTool: false,
+      allowNewCategories: false,
       rules: [],
     });
   };
@@ -165,6 +166,40 @@ ANSWER BY A CATEGORY ID - DO NOT CREATE ENTIRE SENTENCE - DO NOT WRITE CATEGORY 
     expect(prompt).toContain('* Amount: 1000');
     expect(prompt).toContain('* Type: Outcome');
     expect(prompt).toContain('* Date: 2021-01-01');
+  });
+
+  describe('suggestNewCategories gating', () => {
+    afterEach(() => {
+      jest.restoreAllMocks();
+    });
+
+    it('does not offer the "new" category type when suggestNewCategories is disabled', () => {
+      jest.spyOn(config, 'isFeatureEnabled').mockReturnValue(false);
+
+      const transaction = GivenActualData.createTransaction('1', -1000, 'Carrefour 2137');
+      const categoryGroups = GivenActualData.createSampleCategoryGroups();
+      const payees = GivenActualData.createSamplePayees();
+
+      const promptGenerator = new PromptGenerator(promptTemplate);
+      const prompt = promptGenerator.generate(categoryGroups, transaction, payees, []);
+
+      expect(prompt).not.toContain('"new"');
+      expect(prompt).not.toContain('newCategory');
+    });
+
+    it('offers the "new" category type when suggestNewCategories is enabled', () => {
+      jest.spyOn(config, 'isFeatureEnabled').mockReturnValue(true);
+
+      const transaction = GivenActualData.createTransaction('1', -1000, 'Carrefour 2137');
+      const categoryGroups = GivenActualData.createSampleCategoryGroups();
+      const payees = GivenActualData.createSamplePayees();
+
+      const promptGenerator = new PromptGenerator(promptTemplate);
+      const prompt = promptGenerator.generate(categoryGroups, transaction, payees, []);
+
+      expect(prompt).toContain('"new"');
+      expect(prompt).toContain('newCategory');
+    });
   });
 
   describe('web search tool', () => {
